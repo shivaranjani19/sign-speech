@@ -1,0 +1,582 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ISL to Speech</title>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      text-align: center;
+      background: #f4f4f4;
+      padding: 20px;
+    }
+
+    h1 { color: #222; }
+
+    .camera-container {
+      position: relative;
+      width: 480px;
+      max-width: 100%;
+      margin: auto;
+    }
+
+    video, canvas {
+      width: 100%;
+      border-radius: 10px;
+    }
+
+    canvas {
+      position: absolute;
+      left: 0;
+      top: 0;
+    }
+
+    input, button {
+      padding: 10px;
+      margin: 8px;
+      font-size: 16px;
+    }
+
+    button { cursor: pointer; }
+
+    #prediction {
+      color: green;
+      font-size: 28px;
+      font-weight: bold;
+    }
+
+    .panel {
+      background: white;
+      padding: 15px;
+      margin: 15px auto;
+      max-width: 550px;
+      border-radius: 10px;
+    }
+  </style>
+</head>
+
+<body>
+
+  <h1>Indian Sign Language to Speech</h1>
+
+  <div class="panel">
+    <button id="startButton">Start Camera</button>
+    <p id="status">Camera not started</p>
+
+    <div class="camera-container">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="canvas"></canvas>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Record a Sign</h2>
+
+    <input id="signName" type="text" placeholder="Enter sign name">
+    <button id="recordButton">Record</button>
+
+    <p id="recordStatus">Ready to record</p>
+
+    <h3>Recorded Signs</h3>
+    <ul id="sampleList"></ul>
+
+    <button id="clearButton">Delete All Samples</button>
+  </div>
+
+  <div class="panel">
+    <h2>Recognised Sign</h2>
+    <p id="prediction">Waiting...</p>
+    <p id="speechStatus">Speech ready</p>
+    <button id="speakAgainButton" disabled>Speak Again</button>
+  </div>
+
+  <script type="module">
+
+    import {
+      HandLandmarker,
+      FilesetResolver
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+
+    const statusText = document.getElementById("status");
+    const predictionText = document.getElementById("prediction");
+    const speechStatus = document.getElementById("speechStatus");
+    const signNameInput = document.getElementById("signName");
+    const recordStatus = document.getElementById("recordStatus");
+    const sampleList = document.getElementById("sampleList");
+
+    const startButton = document.getElementById("startButton");
+    const recordButton = document.getElementById("recordButton");
+    const clearButton = document.getElementById("clearButton");
+    const speakAgainButton = document.getElementById("speakAgainButton");
+
+    const SAMPLES_KEY = "islSignSamples";
+
+    const DISTANCE_THRESHOLD = 2.5;
+
+    // Recognition confirmation settings
+    const HISTORY_SIZE = 12;
+    const REQUIRED_VOTES = 10;
+    const CONFIRMATION_TIME = 1000;
+
+    let handLandmarker = null;
+    let cameraStarted = false;
+    let samples = {};
+
+    let recording = false;
+    let recordingLabel = "";
+    let recordingCount = 0;
+    let lastSampleTime = 0;
+
+    let predictionHistory = [];
+    let lastSpokenLabel = "";
+    let lastRecognisedLabel = "";
+
+    let candidateLabel = "";
+    let candidateStartTime = 0;
+
+    function loadSamples() {
+      try {
+        let saved = localStorage.getItem(SAMPLES_KEY);
+
+        if (!saved) {
+          for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+
+            try {
+              const value = JSON.parse(localStorage.getItem(key));
+
+              if (
+                value &&
+                typeof value === "object" &&
+                Object.values(value).some(
+                  arr => Array.isArray(arr) &&
+                    arr.some(item => Array.isArray(item))
+                )
+              ) {
+                samples = value;
+                saveSamples();
+                return;
+              }
+            } catch (error) {}
+          }
+        }
+
+        if (saved) samples = JSON.parse(saved);
+
+      } catch (error) {
+        console.error(error);
+        samples = {};
+      }
+
+      updateSampleList();
+    }
+
+    function saveSamples() {
+      localStorage.setItem(SAMPLES_KEY, JSON.stringify(samples));
+      updateSampleList();
+    }
+
+    function updateSampleList() {
+      sampleList.innerHTML = "";
+
+      for (const label of Object.keys(samples)) {
+        const li = document.createElement("li");
+        li.textContent = `${label}: ${samples[label].length} samples`;
+        sampleList.appendChild(li);
+      }
+    }
+
+    function resetRecognition() {
+      predictionHistory = [];
+      candidateLabel = "";
+      candidateStartTime = 0;
+      lastSpokenLabel = "";
+      lastRecognisedLabel = "";
+      speakAgainButton.disabled = true;
+    }
+
+    function normalise(hand) {
+      const wrist = hand[0];
+      const middleBase = hand[9];
+
+      const scale = Math.sqrt(
+        Math.pow(middleBase.x - wrist.x, 2) +
+        Math.pow(middleBase.y - wrist.y, 2) +
+        Math.pow(middleBase.z - wrist.z, 2)
+      );
+
+      if (scale < 0.0001) return null;
+
+      const result = [];
+
+      for (const point of hand) {
+        result.push((point.x - wrist.x) / scale);
+        result.push((point.y - wrist.y) / scale);
+        result.push((point.z - wrist.z) / scale);
+      }
+
+      return result;
+    }
+
+    function recognise(currentHand) {
+      let bestLabel = "Unknown";
+      let bestDistance = Infinity;
+
+      for (const label of Object.keys(samples)) {
+        for (const savedSample of samples[label]) {
+
+          if (
+            !Array.isArray(savedSample) ||
+            savedSample.length !== currentHand.length
+          ) continue;
+
+          let distance = 0;
+
+          for (let i = 0; i < currentHand.length; i++) {
+            distance += Math.pow(
+              currentHand[i] - savedSample[i],
+              2
+            );
+          }
+
+          distance = Math.sqrt(distance);
+
+          if (distance < bestDistance) {
+            bestDistance = distance;
+            bestLabel = label;
+          }
+        }
+      }
+
+      return bestDistance > DISTANCE_THRESHOLD
+        ? "Unknown"
+        : bestLabel;
+    }
+
+    // Check whether enough recent frames agree.
+    function getStablePrediction(newPrediction) {
+      predictionHistory.push(newPrediction);
+
+      if (predictionHistory.length > HISTORY_SIZE) {
+        predictionHistory.shift();
+      }
+
+      const counts = {};
+
+      for (const label of predictionHistory) {
+        counts[label] = (counts[label] || 0) + 1;
+      }
+
+      let bestLabel = "Checking...";
+      let bestCount = 0;
+
+      for (const label of Object.keys(counts)) {
+        if (counts[label] > bestCount) {
+          bestCount = counts[label];
+          bestLabel = label;
+        }
+      }
+
+      if (
+        bestCount >= REQUIRED_VOTES &&
+        bestLabel !== "Unknown"
+      ) {
+        return bestLabel;
+      }
+
+      if (bestCount >= REQUIRED_VOTES) {
+        return "Unknown";
+      }
+
+      return "Checking...";
+    }
+
+    // Require the same stable prediction to persist for one second.
+    function confirmPrediction(label) {
+      const now = performance.now();
+
+      if (label === "Checking...") {
+        candidateLabel = "";
+        candidateStartTime = 0;
+        return;
+      }
+
+      if (label === "Unknown") {
+        candidateLabel = "";
+        candidateStartTime = 0;
+        lastSpokenLabel = "";
+        lastRecognisedLabel = "";
+        speakAgainButton.disabled = true;
+        predictionText.textContent = "Unknown";
+        speechStatus.textContent = "No matching sign";
+        return;
+      }
+
+      if (label !== candidateLabel) {
+        candidateLabel = label;
+        candidateStartTime = now;
+
+        predictionText.textContent = "Hold your sign...";
+        speechStatus.textContent = "Confirming gesture...";
+
+        return;
+      }
+
+      const elapsed = now - candidateStartTime;
+
+      if (elapsed >= CONFIRMATION_TIME) {
+        predictionText.textContent = label;
+
+        lastRecognisedLabel = label;
+        speakAgainButton.disabled = false;
+
+        if (label !== lastSpokenLabel) {
+          lastSpokenLabel = label;
+          speak(label);
+        }
+      } else {
+        predictionText.textContent = "Hold your sign...";
+      }
+    }
+
+    function speak(text) {
+      if (!("speechSynthesis" in window)) {
+        speechStatus.textContent = "Speech is not supported";
+        return;
+      }
+
+      window.speechSynthesis.cancel();
+
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = "en-IN";
+      utterance.rate = 1;
+      utterance.pitch = 1;
+
+      window.speechSynthesis.speak(utterance);
+
+      speechStatus.textContent = "Speaking: " + text;
+    }
+
+    async function loadModel() {
+      statusText.textContent = "Loading model...";
+
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+      );
+
+      handLandmarker = await HandLandmarker.createFromOptions(
+        vision,
+        {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+            delegate: "GPU"
+          },
+          runningMode: "VIDEO",
+          numHands: 1
+        }
+      );
+
+      statusText.textContent = "Model loaded";
+    }
+
+    async function startCamera() {
+      try {
+        startButton.disabled = true;
+
+        await loadModel();
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: true
+        });
+
+        video.srcObject = stream;
+        await video.play();
+
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+
+        cameraStarted = true;
+
+        statusText.textContent = "Camera started";
+
+        requestAnimationFrame(detectHands);
+
+      } catch (error) {
+        console.error(error);
+        statusText.textContent = "Error: " + error.message;
+        startButton.disabled = false;
+      }
+    }
+
+    function drawLandmarks(hand) {
+      const connections = [
+        [0,1],[1,2],[2,3],[3,4],
+        [0,5],[5,6],[6,7],[7,8],
+        [5,9],[9,10],[10,11],[11,12],
+        [9,13],[13,14],[14,15],[15,16],
+        [13,17],[17,18],[18,19],[19,20],
+        [0,17]
+      ];
+
+      ctx.strokeStyle = "lime";
+      ctx.lineWidth = 3;
+
+      for (const [a, b] of connections) {
+        ctx.beginPath();
+        ctx.moveTo(
+          hand[a].x * canvas.width,
+          hand[a].y * canvas.height
+        );
+        ctx.lineTo(
+          hand[b].x * canvas.width,
+          hand[b].y * canvas.height
+        );
+        ctx.stroke();
+      }
+
+      ctx.fillStyle = "red";
+
+      for (const point of hand) {
+        ctx.beginPath();
+        ctx.arc(
+          point.x * canvas.width,
+          point.y * canvas.height,
+          5,
+          0,
+          Math.PI * 2
+        );
+        ctx.fill();
+      }
+    }
+
+    function detectHands() {
+      if (!cameraStarted) return;
+
+      if (video.readyState >= 2) {
+
+        const results = handLandmarker.detectForVideo(
+          video,
+          performance.now()
+        );
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        if (results.landmarks && results.landmarks.length > 0) {
+
+          const hand = results.landmarks[0];
+          drawLandmarks(hand);
+
+          const normalisedHand = normalise(hand);
+
+          if (normalisedHand) {
+
+            if (recording) {
+
+              const now = performance.now();
+
+              if (now - lastSampleTime >= 100) {
+                samples[recordingLabel].push(normalisedHand);
+                recordingCount++;
+                lastSampleTime = now;
+
+                recordStatus.textContent =
+                  `Recording ${recordingCount}/30`;
+
+                if (recordingCount >= 30) {
+                  recording = false;
+                  saveSamples();
+
+                  recordStatus.textContent =
+                    `${recordingLabel}: 30 samples recorded`;
+
+                  recordButton.disabled = false;
+                }
+              }
+
+            } else {
+
+              const rawPrediction = recognise(normalisedHand);
+              const stablePrediction =
+                getStablePrediction(rawPrediction);
+
+              confirmPrediction(stablePrediction);
+            }
+          }
+
+        } else {
+          predictionText.textContent = "No hand detected";
+
+          resetRecognition();
+
+          speechStatus.textContent = "Waiting for a hand";
+        }
+      }
+
+      requestAnimationFrame(detectHands);
+    }
+
+    recordButton.addEventListener("click", () => {
+      const label = signNameInput.value.trim();
+
+      if (!label) {
+        alert("Please enter a sign name");
+        return;
+      }
+
+      if (!cameraStarted) {
+        alert("Start the camera first");
+        return;
+      }
+
+      if (recording) return;
+
+      if (!samples[label]) samples[label] = [];
+
+      recording = true;
+      recordingLabel = label;
+      recordingCount = 0;
+      lastSampleTime = 0;
+
+      resetRecognition();
+
+      recordButton.disabled = true;
+
+      recordStatus.textContent = "Show the sign to the camera";
+    });
+
+    clearButton.addEventListener("click", () => {
+      if (confirm("Delete all recorded samples?")) {
+        samples = {};
+
+        localStorage.removeItem(SAMPLES_KEY);
+
+        updateSampleList();
+        resetRecognition();
+
+        predictionText.textContent = "Waiting...";
+        recordStatus.textContent = "All samples deleted";
+      }
+    });
+
+    speakAgainButton.addEventListener("click", () => {
+      if (lastRecognisedLabel) {
+        speak(lastRecognisedLabel);
+      }
+    });
+
+    startButton.addEventListener("click", startCamera);
+
+    loadSamples();
+
+  </script>
+
+</body>
+</html>
